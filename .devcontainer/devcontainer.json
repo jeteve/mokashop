@@ -17,14 +17,14 @@
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	,"features": {
 		// See https://github.com/devcontainers-extra/features/tree/main/src/protoc
-    	"ghcr.io/devcontainers-extra/features/protoc:1": { "version": "35.1" }
+    	"ghcr.io/devcontainers-extra/features/protoc:1": { "version": "35.1" },
 	}
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "rustc --version",
+	,"postCreateCommand": ".devcontainer/postCreate.sh",
 
 	// Configure tool-specific properties.
 	// "customizations": {},
