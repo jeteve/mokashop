@@ -1,18 +1,21 @@
 [package]
-name = "rust-template"
+name = "mokashop"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 
+
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "mokashop-server"
+path = "src/bin/server.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-default-run="rust-template"
-
 [dependencies]
+tonic = "0.14.6"
+prost = "0.14"
+tonic-prost = "0.14.6"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 
-[dev-dependencies]
-criterion = "0.5.1"
-
-[[bench]]
-name = "simple"
-harness = false
+[build-dependencies]
+tonic-prost-build = "0.14.6"

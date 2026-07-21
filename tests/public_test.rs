@@ -1,4 +1,4 @@
-use rust_template::*;
+use mokashop::*;
 
 #[test]
 fn test_add_two() {
