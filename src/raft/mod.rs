@@ -17,7 +17,7 @@ pub enum AppResult {
 }
 
 openraft::declare_raft_types!(
-    pub TypeConfig:
+    pub OurTypeConfig:
         D = AppCommand,
         R = AppResult,
 );

@@ -1,8 +1,12 @@
-use openraft::{OptionalSend, RaftLogReader, RaftTypeConfig, StorageError, StorageIOError};
+use openraft::RaftTypeConfig;
+use openraft::storage::RaftLogStorage;
+use openraft::{OptionalSend, RaftLogReader, StorageError, StorageIOError};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use std::error::Error;
 use std::fmt::Debug;
-use std::{marker::PhantomData, ops::RangeBounds};
+use std::ops::RangeBounds;
+
+use crate::raft::OurTypeConfig;
 
 // See example there:
 // https://github.com/databendlabs/openraft/blob/main/examples/rocksstore/src/log_store.rs
@@ -13,36 +17,27 @@ use std::{marker::PhantomData, ops::RangeBounds};
 const LOGS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
-struct LogStore<C>
-where
-    C: RaftTypeConfig,
-{
+struct LogStore {
     db: Database, // To be able to flush in another thread.
-    _p: PhantomData<C>,
 }
 
-impl<C> LogStore<C>
-where
-    C: RaftTypeConfig,
-{
+impl LogStore {
     pub fn new(db: Database) -> Self {
-        Self {
-            db,
-            _p: Default::default(),
-        }
+        Self { db }
     }
 }
 
-fn read_logs_error<C: RaftTypeConfig>(e: impl Error + 'static) -> StorageError<C::NodeId> {
+fn read_logs_error(
+    e: impl Error + 'static,
+) -> StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId> {
     StorageError::IO {
         source: StorageIOError::read_logs(&e),
     }
 }
 
-impl<C> RaftLogReader<C> for LogStore<C>
+impl RaftLogReader<OurTypeConfig> for LogStore
 where
-    C: RaftTypeConfig,
-    C::Entry: for<'de> serde::Deserialize<'de>,
+    <OurTypeConfig as RaftTypeConfig>::Entry: for<'de> serde::Deserialize<'de>,
 {
     #[doc = " Get a series of log entries from storage."]
     #[doc = ""]
@@ -53,23 +48,26 @@ where
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
-        let read_txn = self.db.begin_read().map_err(read_logs_error::<C>)?;
-        let logs_table = read_txn
-            .open_table(LOGS_TABLE)
-            .map_err(read_logs_error::<C>)?;
+    ) -> Result<
+        Vec<<OurTypeConfig as RaftTypeConfig>::Entry>,
+        StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>,
+    > {
+        let read_txn = self.db.begin_read().map_err(read_logs_error)?;
+        let logs_table = read_txn.open_table(LOGS_TABLE).map_err(read_logs_error)?;
 
-        let found_range = logs_table.range(range).map_err(read_logs_error::<C>)?;
+        let found_range = logs_table.range(range).map_err(read_logs_error)?;
         found_range
             .map(|e| {
                 e.map(|e| e.1.value().to_vec())
-                    .map_err(|err| Box::new(read_logs_error::<C>(err)))
+                    .map_err(|err| Box::new(read_logs_error(err)))
                     .and_then(|v| {
-                        serde_json::from_slice::<C::Entry>(&v)
-                            .map_err(|err| Box::new(read_logs_error::<C>(err)))
+                        serde_json::from_slice::<<OurTypeConfig as RaftTypeConfig>::Entry>(&v)
+                            .map_err(|err| Box::new(read_logs_error(err)))
                     })
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| *e)
     }
 }
+
+//impl RaftLogStorage<OurTypeConfig> for LogStore {}
