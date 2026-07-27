@@ -1,4 +1,6 @@
 // This is where the v1 traits live:
+pub type Qid = u32;
+
 pub mod v1 {
     const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("barista.v1");
 

@@ -13,3 +13,18 @@ message HelloResponse {
 service BaristaService {
     rpc Hello (HelloRequest) returns (HelloResponse);
 }
+
+
+// Generic Payload for raft API (RaftService)
+// We don't want to be more specific than that, as gRPC
+// is just the transport layer.
+message RaftPayload {
+    bytes data = 1;
+}
+
+
+service RaftService {
+  rpc Vote (RaftPayload) returns (RaftPayload);
+  rpc AppendEntries (RaftPayload) returns (RaftPayload);
+  rpc InstallSnapshot (RaftPayload) returns (RaftPayload);
+}
