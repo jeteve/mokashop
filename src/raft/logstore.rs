@@ -2,7 +2,6 @@ use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{LogId, LogState, RaftTypeConfig, Vote};
 use openraft::{OptionalSend, RaftLogReader, StorageError, StorageIOError};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::Deserialize;
 use std::error::Error;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
@@ -123,7 +122,7 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
                     g.1.value(),
                 )
             })
-            .map_or(Ok(None), |v| v.map(Some))
+            .transpose()
             .map_err(to_storeerr)?;
 
         Ok(LogState::<OurTypeConfig> {
