@@ -43,6 +43,8 @@ jobs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@nightly
       # See doc: https://github.com/xd009642/tarpaulin
+    - name: Install protcol buffer compiler
+      run: sudo apt-get install -y protobuf-compiler
     - name: Tarpaulin
       run: |
         cargo install cargo-binstall
