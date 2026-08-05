@@ -1,13 +1,12 @@
 use openraft::storage::{LogFlushed, RaftLogStorage};
-use openraft::{LogId, LogState, RaftTypeConfig, Vote};
+use openraft::{LogId, LogState, RaftLogId, RaftTypeConfig, Vote};
 use openraft::{OptionalSend, RaftLogReader, StorageError, StorageIOError};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::error::Error;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
-
-use crate::raft::OurTypeConfig;
 
 // See example there:
 // https://github.com/databendlabs/openraft/blob/main/examples/rocksstore/src/log_store.rs
@@ -19,25 +18,29 @@ const LOGS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 #[derive(Clone)]
-struct LogStore {
+struct LogStore<C: RaftTypeConfig> {
     db: Arc<Database>, // To be able to flush in another thread and clone.
+    _ctype: std::marker::PhantomData<C>,
 }
 
-impl LogStore {
+impl<C: RaftTypeConfig> LogStore<C> {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            _ctype: PhantomData::<C>,
+        }
     }
 }
 
-fn to_storeerr(e: impl Error + 'static) -> StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId> {
+fn to_storeerr<C: RaftTypeConfig>(e: impl Error + 'static) -> StorageError<C::NodeId> {
     StorageError::IO {
         source: StorageIOError::read_logs(&e),
     }
 }
 
-impl RaftLogReader<OurTypeConfig> for LogStore
+impl<C: RaftTypeConfig> RaftLogReader<C> for LogStore<C>
 where
-    <OurTypeConfig as RaftTypeConfig>::Entry: for<'de> serde::Deserialize<'de>,
+    C::Entry: for<'de> serde::Deserialize<'de>,
 {
     #[doc = " Get a series of log entries from storage."]
     #[doc = ""]
@@ -48,21 +51,18 @@ where
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<
-        Vec<<OurTypeConfig as RaftTypeConfig>::Entry>,
-        StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-    > {
-        let read_txn = self.db.begin_read().map_err(to_storeerr)?;
-        let logs_table = read_txn.open_table(LOGS_TABLE).map_err(to_storeerr)?;
+    ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
+        let read_txn = self.db.begin_read().map_err(to_storeerr::<C>)?;
+        let logs_table = read_txn.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
 
-        let found_range = logs_table.range(range).map_err(to_storeerr)?;
+        let found_range = logs_table.range(range).map_err(to_storeerr::<C>)?;
         found_range
             .map(|e| {
                 e.map(|e| e.1.value().to_vec())
-                    .map_err(|err| Box::new(to_storeerr(err)))
+                    .map_err(|err| Box::new(to_storeerr::<C>(err)))
                     .and_then(|v| {
-                        serde_json::from_slice::<<OurTypeConfig as RaftTypeConfig>::Entry>(&v)
-                            .map_err(|err| Box::new(to_storeerr(err)))
+                        serde_json::from_slice::<C::Entry>(&v)
+                            .map_err(|err| Box::new(to_storeerr::<C>(err)))
                     })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -70,28 +70,25 @@ where
     }
 }
 
-fn read_meta<D: for<'de> serde::Deserialize<'de>>(
+fn read_meta<C: RaftTypeConfig, D: for<'de> serde::Deserialize<'de>>(
     meta_table: &redb::ReadOnlyTable<&str, &[u8]>,
     meta: &str,
-) -> Result<Option<D>, StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>> {
+) -> Result<Option<D>, StorageError<C::NodeId>> {
     meta_table
         .get(meta)
-        .map_err(to_storeerr)?
-        .map(|g| serde_json::from_slice::<D>(g.value()).map_err(to_storeerr))
+        .map_err(to_storeerr::<C>)?
+        .map(|g| serde_json::from_slice::<D>(g.value()).map_err(to_storeerr::<C>))
         .map_or(Ok(None), |v| v.map(Some))
 }
 
-fn log_id_meta(
+fn log_id_meta<C: RaftTypeConfig>(
     meta_table: &redb::ReadOnlyTable<&str, &[u8]>,
     meta: &str,
-) -> Result<
-    Option<LogId<<OurTypeConfig as RaftTypeConfig>::NodeId>>,
-    StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-> {
-    read_meta::<LogId<<OurTypeConfig as RaftTypeConfig>::NodeId>>(meta_table, meta)
+) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+    read_meta::<C, LogId<C::NodeId>>(meta_table, meta)
 }
 
-impl RaftLogStorage<OurTypeConfig> for LogStore {
+impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C> {
     #[doc = " Log reader type."]
     #[doc = ""]
     #[doc = " Log reader is used by multiple replication tasks, which read logs and send them to remote"]
@@ -103,31 +100,24 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
     #[doc = " The impl should **not** consider the applied log id in state machine."]
     #[doc = " The returned `last_log_id` could be the log id of the last present log entry, or the"]
     #[doc = " `last_purged_log_id` if there is no entry at all."]
-    async fn get_log_state(
-        &mut self,
-    ) -> Result<LogState<OurTypeConfig>, StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>>
-    {
-        let read_txn = self.db.begin_read().map_err(to_storeerr)?;
+    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
+        let read_txn = self.db.begin_read().map_err(to_storeerr::<C>)?;
         let meta_table: redb::ReadOnlyTable<&str, &[u8]> =
-            read_txn.open_table(META_TABLE).map_err(to_storeerr)?;
+            read_txn.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
 
-        let last_purged_log_id = log_id_meta(&meta_table, "last_purged_log_id")?;
+        let last_purged_log_id = log_id_meta::<C>(&meta_table, "last_purged_log_id")?;
 
-        let logs = read_txn.open_table(LOGS_TABLE).map_err(to_storeerr)?;
-        let last_entry = logs.last().map_err(to_storeerr)?;
+        let logs = read_txn.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
+        let last_entry = logs.last().map_err(to_storeerr::<C>)?;
 
         let last_log_id = last_entry
-            .map(|g| {
-                serde_json::from_slice::<LogId<<OurTypeConfig as RaftTypeConfig>::NodeId>>(
-                    g.1.value(),
-                )
-            })
+            .map(|g| serde_json::from_slice::<LogId<C::NodeId>>(g.1.value()))
             .transpose()
-            .map_err(to_storeerr)?;
+            .map_err(to_storeerr::<C>)?;
 
-        Ok(LogState::<OurTypeConfig> {
+        Ok(LogState::<C> {
+            last_log_id: last_log_id.or_else(|| last_purged_log_id.clone()),
             last_purged_log_id,
-            last_log_id: last_log_id.or(last_purged_log_id),
         })
     }
 
@@ -144,34 +134,26 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
     #[doc = " ### To ensure correctness:"]
     #[doc = ""]
     #[doc = " The vote must be persisted on disk before returning."]
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-    ) -> Result<(), StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>> {
-        let write_tx = self.db.begin_write().map_err(to_storeerr)?;
+    async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+        let write_tx = self.db.begin_write().map_err(to_storeerr::<C>)?;
         {
-            let mut meta_table = write_tx.open_table(META_TABLE).map_err(to_storeerr)?;
-            let json_bytes = serde_json::to_vec(vote).map_err(to_storeerr)?;
+            let mut meta_table = write_tx.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
+            let json_bytes = serde_json::to_vec(vote).map_err(to_storeerr::<C>)?;
             meta_table
                 .insert("vote", json_bytes.as_slice())
-                .map_err(to_storeerr)?;
+                .map_err(to_storeerr::<C>)?;
         }
-        write_tx.commit().map_err(to_storeerr)?;
+        write_tx.commit().map_err(to_storeerr::<C>)?;
 
         Ok(())
     }
 
     #[doc = " Return the last saved vote by [`Self::save_vote`]."]
-    async fn read_vote(
-        &mut self,
-    ) -> Result<
-        Option<Vote<<OurTypeConfig as RaftTypeConfig>::NodeId>>,
-        StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-    > {
-        let read_txn = self.db.begin_read().map_err(to_storeerr)?;
+    async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
+        let read_txn = self.db.begin_read().map_err(to_storeerr::<C>)?;
         let meta_table: redb::ReadOnlyTable<&str, &[u8]> =
-            read_txn.open_table(META_TABLE).map_err(to_storeerr)?;
-        read_meta::<Vote<<OurTypeConfig as RaftTypeConfig>::NodeId>>(&meta_table, "vote")
+            read_txn.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
+        read_meta::<C, Vote<C::NodeId>>(&meta_table, "vote")
     }
 
     #[doc = " Append log entries and call the `callback` once logs are persisted on disk."]
@@ -195,24 +177,24 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<OurTypeConfig>,
-    ) -> Result<(), StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>>
+        callback: LogFlushed<C>,
+    ) -> Result<(), StorageError<C::NodeId>>
     where
-        I: IntoIterator<Item = <OurTypeConfig as RaftTypeConfig>::Entry> + OptionalSend,
+        I: IntoIterator<Item = C::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let write_tx = self.db.begin_write().map_err(to_storeerr)?;
+        let write_tx = self.db.begin_write().map_err(to_storeerr::<C>)?;
 
         {
-            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr)?;
+            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
             for e in entries {
-                let bytes = serde_json::to_vec(&e).map_err(to_storeerr)?;
-                logs.insert(e.log_id.index, bytes.as_slice())
-                    .map_err(to_storeerr)?;
+                let bytes = serde_json::to_vec(&e).map_err(to_storeerr::<C>)?;
+                logs.insert(e.get_log_id().index, bytes.as_slice())
+                    .map_err(to_storeerr::<C>)?;
             }
         }
 
-        write_tx.commit().map_err(to_storeerr)?;
+        write_tx.commit().map_err(to_storeerr::<C>)?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -222,19 +204,16 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
     #[doc = " ### To ensure correctness:"]
     #[doc = ""]
     #[doc = " - It must not leave a **hole** in logs."]
-    async fn truncate(
-        &mut self,
-        log_id: LogId<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-    ) -> Result<(), StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>> {
-        let write_tx = self.db.begin_write().map_err(to_storeerr)?;
+    async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+        let write_tx = self.db.begin_write().map_err(to_storeerr::<C>)?;
 
         {
-            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr)?;
+            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
             logs.retain_in((log_id.index).., |_, _| false)
-                .map_err(to_storeerr)?;
+                .map_err(to_storeerr::<C>)?;
         }
 
-        write_tx.commit().map_err(to_storeerr)?;
+        write_tx.commit().map_err(to_storeerr::<C>)?;
         Ok(())
     }
 
@@ -243,25 +222,22 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
     #[doc = " ### To ensure correctness:"]
     #[doc = ""]
     #[doc = " - It must not leave a **hole** in logs."]
-    async fn purge(
-        &mut self,
-        log_id: LogId<<OurTypeConfig as RaftTypeConfig>::NodeId>,
-    ) -> Result<(), StorageError<<OurTypeConfig as RaftTypeConfig>::NodeId>> {
+    async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
         // Dont forget to set last purge ID.
 
-        let write_tx = self.db.begin_write().map_err(to_storeerr)?;
+        let write_tx = self.db.begin_write().map_err(to_storeerr::<C>)?;
 
         {
-            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr)?;
+            let mut logs = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
             logs.retain_in(..=(log_id.index), |_, _| false)
-                .map_err(to_storeerr)?;
-            let mut meta = write_tx.open_table(META_TABLE).map_err(to_storeerr)?;
-            let bytes = serde_json::to_vec(&log_id).map_err(to_storeerr)?;
+                .map_err(to_storeerr::<C>)?;
+            let mut meta = write_tx.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
+            let bytes = serde_json::to_vec(&log_id).map_err(to_storeerr::<C>)?;
             meta.insert("last_purged_log_id", bytes.as_slice())
-                .map_err(to_storeerr)?;
+                .map_err(to_storeerr::<C>)?;
         }
 
-        write_tx.commit().map_err(to_storeerr)?;
+        write_tx.commit().map_err(to_storeerr::<C>)?;
         Ok(())
     }
 }
@@ -270,6 +246,7 @@ impl RaftLogStorage<OurTypeConfig> for LogStore {
 mod tests {
     use std::sync::Arc;
 
+    use crate::raft::OurTypeConfig;
     use crate::raft::logstore::LogStore;
     use openraft::{Vote, storage::RaftLogStorage};
     use redb::Database;
@@ -280,7 +257,7 @@ mod tests {
     async fn test_my_storage() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = Database::create(file.path()).unwrap();
-        let mut store = LogStore::new(Arc::new(db));
+        let mut store = LogStore::<OurTypeConfig>::new(Arc::new(db));
         // See https://docs.rs/openraft/latest/src/openraft/testing/suite.rs.html
 
         store.save_vote(&Vote::new(100, NODE_ID)).await.unwrap();
