@@ -246,7 +246,8 @@ impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::raft::OurTypeConfig;
+    // This shouldn't matter.
+    use crate::raft::ShardConfig;
     use crate::raft::logstore::LogStore;
     use openraft::{Vote, storage::RaftLogStorage};
     use redb::Database;
@@ -257,7 +258,7 @@ mod tests {
     async fn test_my_storage() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = Database::create(file.path()).unwrap();
-        let mut store = LogStore::<OurTypeConfig>::new(Arc::new(db));
+        let mut store = LogStore::<ShardConfig>::new(Arc::new(db));
         // See https://docs.rs/openraft/latest/src/openraft/testing/suite.rs.html
 
         store.save_vote(&Vote::new(100, NODE_ID)).await.unwrap();
