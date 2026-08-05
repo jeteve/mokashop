@@ -73,18 +73,23 @@ where
 fn read_meta<C: RaftTypeConfig, D: for<'de> serde::Deserialize<'de>>(
     meta_table: &redb::ReadOnlyTable<&str, &[u8]>,
     meta: &str,
-) -> Result<Option<D>, StorageError<C::NodeId>> {
+) -> Result<Option<D>, Box<StorageError<C::NodeId>>> {
     meta_table
         .get(meta)
         .map_err(to_storeerr::<C>)?
-        .map(|g| serde_json::from_slice::<D>(g.value()).map_err(to_storeerr::<C>))
-        .map_or(Ok(None), |v| v.map(Some))
+        .map(|g| serde_json::from_slice::<D>(g.value()).map_err(|e| Box::new(to_storeerr::<C>(e))))
+        .transpose()
 }
+
+type LogIdMeta<C> = Result<
+    Option<LogId<<C as RaftTypeConfig>::NodeId>>,
+    Box<StorageError<<C as RaftTypeConfig>::NodeId>>,
+>;
 
 fn log_id_meta<C: RaftTypeConfig>(
     meta_table: &redb::ReadOnlyTable<&str, &[u8]>,
     meta: &str,
-) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+) -> LogIdMeta<C> {
     read_meta::<C, LogId<C::NodeId>>(meta_table, meta)
 }
 
@@ -105,7 +110,8 @@ impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C> {
         let meta_table: redb::ReadOnlyTable<&str, &[u8]> =
             read_txn.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
 
-        let last_purged_log_id = log_id_meta::<C>(&meta_table, "last_purged_log_id")?;
+        let last_purged_log_id =
+            log_id_meta::<C>(&meta_table, "last_purged_log_id").map_err(|e| *e)?;
 
         let logs = read_txn.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
         let last_entry = logs.last().map_err(to_storeerr::<C>)?;
@@ -153,7 +159,7 @@ impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C> {
         let read_txn = self.db.begin_read().map_err(to_storeerr::<C>)?;
         let meta_table: redb::ReadOnlyTable<&str, &[u8]> =
             read_txn.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
-        read_meta::<C, Vote<C::NodeId>>(&meta_table, "vote")
+        read_meta::<C, Vote<C::NodeId>>(&meta_table, "vote").map_err(|e| *e)
     }
 
     #[doc = " Append log entries and call the `callback` once logs are persisted on disk."]
