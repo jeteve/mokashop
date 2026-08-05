@@ -25,3 +25,4 @@ openraft::declare_raft_types!(
 );
 
 pub mod logstore;
+pub mod statemachine;
