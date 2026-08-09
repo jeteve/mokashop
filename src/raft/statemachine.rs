@@ -1,15 +1,11 @@
-use std::{
-    io::Cursor,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use openraft::{
-    AppData, LogId, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta, StorageError,
-    StorageIOError, StoredMembership,
+    LogId, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership,
 };
 use tokio::sync::RwLock;
 
@@ -43,7 +39,7 @@ pub struct StateMachine<C: RaftTypeConfig, AppData> {
 
 pub struct StateMachineArc<C: RaftTypeConfig, AppData> {
     inner: Arc<StateMachine<C, AppData>>,
-    snapshot_data_hander: fn(Vec<u8>) -> C::SnapshotData,
+    snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData,
 }
 
 impl<C: RaftTypeConfig, AppData: Send + Sync + 'static + serde::Serialize> RaftSnapshotBuilder<C>
@@ -99,7 +95,7 @@ where
 
         Ok(openraft::Snapshot {
             meta,
-            snapshot: Box::new((self.snapshot_data_hander)(app_data)),
+            snapshot: Box::new((self.snapshot_data_handle)(app_data)),
             // This cannot be concrete, as this depends on the C::SnapShotData generic type.
             //snapshot: Box::new(Cursor::new(app_data)),
         })
