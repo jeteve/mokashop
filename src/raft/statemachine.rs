@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 // AppData can be accessed in a Multiple Reader, Single writer mode.
 //
 
-struct RaftData<C: RaftTypeConfig, AppData> {
+pub struct RaftData<C: RaftTypeConfig, AppData> {
     pub last_applied_log: Option<LogId<C::NodeId>>,
     pub last_membership: StoredMembership<C::NodeId, C::Node>,
     pub app_data: AppData,
@@ -30,6 +30,8 @@ mod tests_raft_data {
 
     use openraft::{Entry, EntryPayload::Normal, LeaderId};
     use serde::{Deserialize, Serialize};
+
+    use super::*;
 
     #[derive(Deserialize, Serialize)]
     pub enum Cmd {
@@ -44,8 +46,9 @@ mod tests_raft_data {
         Error(String),
     }
 
+    #[derive(Serialize)]
     pub struct MyAppData {
-        s: String,
+        pub s: String,
     }
 
     openraft::declare_raft_types!(
@@ -54,38 +57,31 @@ mod tests_raft_data {
             R = Resp,
     );
 
+    // Concrete implementation of Entry Payload application
+    pub fn apply_entry(
+        d: &mut RaftData<MyTypeConf, MyAppData>,
+        e: <MyTypeConf as openraft::RaftTypeConfig>::Entry,
+    ) -> Resp {
+        let p = e.payload;
+        match p {
+            EntryPayload::Blank => Resp::None,
+            EntryPayload::Normal(ref cmd) => match cmd {
+                Cmd::Set(s) => {
+                    d.app_data.s = s.clone();
+                    Resp::Ok("SET!".into())
+                }
+                Cmd::Get => Resp::Ok(d.app_data.s.clone()),
+            },
+            EntryPayload::Membership(m) => {
+                d.last_membership = openraft::StoredMembership::new(Some(e.log_id), m.clone());
+                Resp::None
+            }
+        }
+    }
+
     #[test]
     fn test_raftdata() {
         use super::*;
-
-        // Concrete implementation of payload extraction.
-        fn entry_payload(
-            e: <MyTypeConf as openraft::RaftTypeConfig>::Entry,
-        ) -> EntryPayload<MyTypeConf> {
-            e.payload
-        }
-
-        // Concrete implementation of Payload application
-        fn apply_entry(
-            d: &mut RaftData<MyTypeConf, MyAppData>,
-            e: <MyTypeConf as openraft::RaftTypeConfig>::Entry,
-        ) -> Resp {
-            let p = e.payload;
-            match p {
-                EntryPayload::Blank => Resp::None,
-                EntryPayload::Normal(ref cmd) => match cmd {
-                    Cmd::Set(s) => {
-                        d.app_data.s = s.clone();
-                        Resp::Ok("SET!".into())
-                    }
-                    Cmd::Get => Resp::Ok(d.app_data.s.clone()),
-                },
-                EntryPayload::Membership(m) => {
-                    d.last_membership = openraft::StoredMembership::new(Some(e.log_id), m.clone());
-                    Resp::None
-                }
-            }
-        }
 
         let mut d = RaftData::<MyTypeConf, MyAppData> {
             last_applied_log: None,
@@ -132,10 +128,29 @@ pub struct StateMachine<C: RaftTypeConfig, AppData> {
     current_snapshot: RwLock<Option<StoredSnapshot<C>>>,
 }
 
-#[derive(Clone)]
+impl<C: RaftTypeConfig, AppData> StateMachine<C, AppData> {
+    pub fn new(raft_data: RaftData<C, AppData>) -> Self {
+        Self {
+            raft_data: RwLock::new(raft_data),
+            snapshot_idx: AtomicU64::default(),
+            current_snapshot: RwLock::new(None),
+        }
+    }
+}
+
 pub struct StateMachineArc<C: RaftTypeConfig, AppData> {
-    inner: Arc<StateMachine<C, AppData>>,
-    snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData,
+    pub inner: Arc<StateMachine<C, AppData>>,
+    pub snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData,
+}
+
+// Specific clone implementation.
+impl<C: RaftTypeConfig, AppData> Clone for StateMachineArc<C, AppData> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            snapshot_data_handle: self.snapshot_data_handle,
+        }
+    }
 }
 
 impl<C: RaftTypeConfig, AppData: Send + Sync + 'static + serde::Serialize> RaftSnapshotBuilder<C>
@@ -196,6 +211,43 @@ where
             // This cannot be concrete, as this depends on the C::SnapShotData generic type.
             //snapshot: Box::new(Cursor::new(app_data)),
         })
+    }
+}
+
+#[cfg(test)]
+mod test_state_machine_snapshot {
+    use std::io::Cursor;
+
+    use super::tests_raft_data::*;
+    use super::*;
+
+    pub fn snapshot_data_handle(v: Vec<u8>) -> <MyTypeConf as RaftTypeConfig>::SnapshotData {
+        Cursor::new(v)
+    }
+
+    #[tokio::test]
+    async fn test_state_machine() {
+        // First build the Raft Data.
+        let d = RaftData::<MyTypeConf, MyAppData> {
+            last_applied_log: None,
+            last_membership: StoredMembership::default(),
+            app_data: MyAppData { s: "Bla".into() },
+            apply_entry,
+        };
+
+        // Then build the new state machine:
+        let sm = StateMachine::new(d);
+
+        // Then the Arc around it.
+
+        let mut asm = StateMachineArc {
+            inner: Arc::new(sm),
+            snapshot_data_handle,
+        };
+
+        // Check we can build the snapshot.
+        let r = asm.build_snapshot().await;
+        assert!(r.is_ok());
     }
 }
 
@@ -293,7 +345,7 @@ where
     #[doc = " asynchronous sync primitives to serialize access to the common internal object, if"]
     #[doc = " needed."]
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        todo!()
+        self.clone()
     }
 
     #[doc = " Create a new blank snapshot, returning a writable handle to the snapshot object."]
