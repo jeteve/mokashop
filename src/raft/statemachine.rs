@@ -4,8 +4,8 @@ use std::sync::{
 };
 
 use openraft::{
-    LogId, OptionalSend, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta, StorageError,
-    StorageIOError, StoredMembership, storage::RaftStateMachine,
+    EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder, RaftTypeConfig,
+    SnapshotMeta, StorageError, StorageIOError, StoredMembership, storage::RaftStateMachine,
 };
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -16,10 +16,95 @@ use tokio::sync::RwLock;
 // This what raft snapshots between nodes.
 // AppData can be accessed in a Multiple Reader, Single writer mode.
 //
+
 struct RaftData<C: RaftTypeConfig, AppData> {
     pub last_applied_log: Option<LogId<C::NodeId>>,
     pub last_membership: StoredMembership<C::NodeId, C::Node>,
     pub app_data: AppData,
+    pub apply_entry: fn(&mut Self, C::Entry) -> C::R,
+}
+
+#[cfg(test)]
+mod tests_raft_data {
+    use std::io::Cursor;
+
+    use openraft::{Entry, EntryPayload::Normal, LeaderId};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Deserialize, Serialize)]
+    pub enum Cmd {
+        Set(String),
+    }
+
+    #[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+    pub enum Resp {
+        None,
+        Ok(String),
+        Error(String),
+    }
+
+    pub struct MyAppData {
+        s: String,
+    }
+
+    openraft::declare_raft_types!(
+        pub MyTypeConf:
+            D = Cmd,
+            R = Resp,
+    );
+
+    #[test]
+    fn test_raftdata() {
+        use super::*;
+
+        // Concrete implementation of payload extraction.
+        fn entry_payload(
+            e: <MyTypeConf as openraft::RaftTypeConfig>::Entry,
+        ) -> EntryPayload<MyTypeConf> {
+            e.payload
+        }
+
+        // Concrete implementation of Payload application
+        fn apply_entry(
+            d: &mut RaftData<MyTypeConf, MyAppData>,
+            e: <MyTypeConf as openraft::RaftTypeConfig>::Entry,
+        ) -> Resp {
+            let p = e.payload;
+            match p {
+                EntryPayload::Blank => Resp::None,
+                EntryPayload::Normal(ref cmd) => match cmd {
+                    Cmd::Set(s) => {
+                        d.app_data.s = s.clone();
+                        Resp::Ok("SET!".into())
+                    }
+                },
+                EntryPayload::Membership(m) => {
+                    d.last_membership = openraft::StoredMembership::new(Some(e.log_id), m.clone());
+                    Resp::None
+                }
+            }
+        }
+
+        let mut d = RaftData::<MyTypeConf, MyAppData> {
+            last_applied_log: None,
+            last_membership: StoredMembership::default(),
+            app_data: MyAppData { s: "Bla".into() },
+            apply_entry,
+        };
+
+        // For the Entry trait methods. (new_blank for instance..)
+        use openraft::entry::RaftEntry;
+        let leader_id = LeaderId::new(1, 1);
+        let log_id = LogId::<<MyTypeConf as RaftTypeConfig>::NodeId>::new(leader_id, 1);
+        let e = <MyTypeConf as RaftTypeConfig>::Entry::new_blank(log_id);
+        assert_eq!((d.apply_entry)(&mut d, e), Resp::None);
+
+        let payload = EntryPayload::Normal(Cmd::Set("sausage".into()));
+        type MyEntry = <MyTypeConf as RaftTypeConfig>::Entry;
+        let e = MyEntry { log_id, payload };
+
+        assert_eq!((d.apply_entry)(&mut d, e), Resp::Ok("SET!".into()));
+    }
 }
 
 // A snapshot of the RaftData
@@ -35,6 +120,8 @@ pub struct StoredSnapshot<C: RaftTypeConfig> {
 pub struct StateMachine<C: RaftTypeConfig, AppData> {
     raft_data: RwLock<RaftData<C, AppData>>, // Tokyo RwLock
     snapshot_idx: AtomicU64,
+    // TODO: Persist this on disk, given
+    // we choose to implement a Snapshot based state.
     current_snapshot: RwLock<Option<StoredSnapshot<C>>>,
 }
 
@@ -93,6 +180,7 @@ where
             data: app_data.clone(),
         };
 
+        // TODO: Persist this on disk.
         *current_snapshot = Some(snapshot);
 
         Ok(openraft::Snapshot {
@@ -104,6 +192,8 @@ where
     }
 }
 
+// Example there:
+// https://github.com/databendlabs/openraft/blob/v0.9.21/examples/raft-kv-memstore/src/store/mod.rs#L136
 impl<C: RaftTypeConfig, AppData: Send + Sync + 'static> RaftStateMachine<C>
     for StateMachineArc<C, AppData>
 where
@@ -131,7 +221,11 @@ where
         ),
         StorageError<C::NodeId>,
     > {
-        todo!()
+        let raft_data = self.inner.raft_data.read().await;
+        Ok((
+            raft_data.last_applied_log,
+            raft_data.last_membership.clone(),
+        ))
     }
 
     #[doc = " Apply the given payload of entries to the state machine."]
@@ -165,7 +259,21 @@ where
         I: IntoIterator<Item = C::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        todo!()
+        let mut res = Vec::new(); //No `with_capacity`; do not know `len` of iterator
+
+        // Write all entries in one go
+        let mut sm = self.inner.raft_data.write().await;
+
+        for e in entries {
+            sm.last_applied_log = Some(*e.get_log_id());
+
+            // Turn entry into a response.
+            // Note we dont do any IO here as this is a snapshot based persistent implementation
+            // so there cannot be any StorageError.
+            res.push((sm.apply_entry)(&mut sm, e));
+        }
+
+        Ok(res)
     }
 
     #[doc = " Get the snapshot builder for the state machine."]
