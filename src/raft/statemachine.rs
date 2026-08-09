@@ -34,6 +34,7 @@ mod tests_raft_data {
     #[derive(Deserialize, Serialize)]
     pub enum Cmd {
         Set(String),
+        Get,
     }
 
     #[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -77,6 +78,7 @@ mod tests_raft_data {
                         d.app_data.s = s.clone();
                         Resp::Ok("SET!".into())
                     }
+                    Cmd::Get => Resp::Ok(d.app_data.s.clone()),
                 },
                 EntryPayload::Membership(m) => {
                     d.last_membership = openraft::StoredMembership::new(Some(e.log_id), m.clone());
@@ -99,11 +101,16 @@ mod tests_raft_data {
         let e = <MyTypeConf as RaftTypeConfig>::Entry::new_blank(log_id);
         assert_eq!((d.apply_entry)(&mut d, e), Resp::None);
 
-        let payload = EntryPayload::Normal(Cmd::Set("sausage".into()));
         type MyEntry = <MyTypeConf as RaftTypeConfig>::Entry;
+
+        let payload = EntryPayload::Normal(Cmd::Set("sausage".into()));
         let e = MyEntry { log_id, payload };
 
         assert_eq!((d.apply_entry)(&mut d, e), Resp::Ok("SET!".into()));
+
+        let payload = EntryPayload::Normal(Cmd::Get);
+        let e = MyEntry { log_id, payload };
+        assert_eq!((d.apply_entry)(&mut d, e), Resp::Ok("sausage".into()));
     }
 }
 
