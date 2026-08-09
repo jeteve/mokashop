@@ -246,8 +246,10 @@ mod test_state_machine_snapshot {
         };
 
         // Check we can build the snapshot.
+        assert!(asm.inner.current_snapshot.read().await.is_none());
         let r = asm.build_snapshot().await;
         assert!(r.is_ok());
+        assert!(asm.inner.current_snapshot.read().await.is_some());
     }
 }
 
