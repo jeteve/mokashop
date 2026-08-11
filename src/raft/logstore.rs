@@ -18,8 +18,8 @@ const LOGS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("logs");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 #[derive(Clone)]
-struct LogStore<C: RaftTypeConfig> {
-    db: Arc<Database>, // To be able to flush in another thread and clone.
+pub struct LogStore<C: RaftTypeConfig> {
+    pub db: Arc<Database>, // To be able to flush in another thread and clone.
     _ctype: std::marker::PhantomData<C>,
 }
 

@@ -4,10 +4,10 @@ use std::sync::{
 };
 
 use openraft::{
-    EntryPayload, LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder, RaftTypeConfig,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership, storage::RaftStateMachine,
+    LogId, OptionalSend, RaftLogId, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership, storage::RaftStateMachine,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 // Example there: https://github.com/databendlabs/openraft/blob/v0.9.21/examples/raft-kv-memstore/src/store/mod.rs#L79
@@ -28,12 +28,12 @@ pub struct RaftData<C: RaftTypeConfig, AppData> {
 mod tests_raft_data {
     use std::io::Cursor;
 
-    use openraft::{Entry, EntryPayload::Normal, LeaderId};
+    use openraft::{EntryPayload, LeaderId};
     use serde::{Deserialize, Serialize};
 
     use super::*;
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub enum Cmd {
         Set(String),
         Get,
@@ -46,7 +46,7 @@ mod tests_raft_data {
         Error(String),
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, Deserialize)]
     pub struct MyAppData {
         pub s: String,
     }
@@ -140,7 +140,10 @@ impl<C: RaftTypeConfig, AppData> StateMachine<C, AppData> {
 
 pub struct StateMachineArc<C: RaftTypeConfig, AppData> {
     pub inner: Arc<StateMachine<C, AppData>>,
+    // TODO: Change this so it can return an Result<..,  StorageError<C::NodeId>>
     pub snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData,
+    pub snapshot_data_blank: fn() -> C::SnapshotData,
+    pub snapshot_data: fn(C::SnapshotData) -> Vec<u8>,
 }
 
 // Specific clone implementation.
@@ -149,6 +152,8 @@ impl<C: RaftTypeConfig, AppData> Clone for StateMachineArc<C, AppData> {
         Self {
             inner: Arc::clone(&self.inner),
             snapshot_data_handle: self.snapshot_data_handle,
+            snapshot_data_blank: self.snapshot_data_blank,
+            snapshot_data: self.snapshot_data,
         }
     }
 }
@@ -225,6 +230,13 @@ mod test_state_machine_snapshot {
         Cursor::new(v)
     }
 
+    pub fn snapshot_data_blank() -> <MyTypeConf as RaftTypeConfig>::SnapshotData {
+        snapshot_data_handle(Vec::new())
+    }
+    pub fn snapshot_data(d: <MyTypeConf as RaftTypeConfig>::SnapshotData) -> Vec<u8> {
+        d.into_inner()
+    }
+
     #[tokio::test]
     async fn test_state_machine() {
         // First build the Raft Data.
@@ -243,6 +255,8 @@ mod test_state_machine_snapshot {
         let mut asm = StateMachineArc {
             inner: Arc::new(sm),
             snapshot_data_handle,
+            snapshot_data_blank,
+            snapshot_data,
         };
 
         // Check we can build the snapshot.
@@ -255,8 +269,8 @@ mod test_state_machine_snapshot {
 
 // Example there:
 // https://github.com/databendlabs/openraft/blob/v0.9.21/examples/raft-kv-memstore/src/store/mod.rs#L136
-impl<C: RaftTypeConfig, AppData: Send + Sync + 'static> RaftStateMachine<C>
-    for StateMachineArc<C, AppData>
+impl<C: RaftTypeConfig, AppData: Send + Sync + 'static + for<'a> Deserialize<'a>>
+    RaftStateMachine<C> for StateMachineArc<C, AppData>
 where
     AppData: Serialize,
     C::NodeId: Copy,
@@ -326,12 +340,12 @@ where
         let mut sm = self.inner.raft_data.write().await;
 
         for e in entries {
-            sm.last_applied_log = Some(*e.get_log_id());
-
+            let log_id = *e.get_log_id();
             // Turn entry into a response.
             // Note we dont do any IO here as this is a snapshot based persistent implementation
             // so there cannot be any StorageError.
             res.push((sm.apply_entry)(&mut sm, e));
+            sm.last_applied_log = Some(log_id);
         }
 
         Ok(res)
@@ -360,7 +374,8 @@ where
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<C::SnapshotData>, StorageError<C::NodeId>> {
-        todo!()
+        // This could be something that writes to the disk for instance.
+        Ok(Box::new((self.snapshot_data_blank)()))
     }
 
     #[doc = " Install a snapshot which has finished streaming from the leader."]
@@ -379,6 +394,35 @@ where
         meta: &SnapshotMeta<C::NodeId, C::Node>,
         snapshot: Box<C::SnapshotData>,
     ) -> Result<(), StorageError<C::NodeId>> {
+        // Build a new snapshot.
+        let new_snapshot = StoredSnapshot::<C> {
+            meta: meta.clone(),
+            data: (self.snapshot_data)(*snapshot),
+        };
+
+        // Update the state machine.
+        let updated_state_machine_data = serde_json::from_slice(&new_snapshot.data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e))?;
+
+        let updated_state_machine = RaftData::<C, AppData> {
+            last_applied_log: meta.last_log_id,
+            last_membership: meta.last_membership.clone(),
+            app_data: updated_state_machine_data,
+            apply_entry: self.inner.raft_data.read().await.apply_entry,
+        };
+        let mut state_machine = self.inner.raft_data.write().await;
+        // No need to save to disk or anything. Only in memory please.
+        *state_machine = updated_state_machine;
+
+        // Lock the current snapshot before releasing the lock on the state machine, to avoid a race
+        // condition on the written snapshot
+        let mut current_snapshot = self.inner.current_snapshot.write().await;
+        drop(state_machine);
+
+        // Update current snapshot.
+        // TODO: Save that to disk.
+        *current_snapshot = Some(new_snapshot);
+
         todo!()
     }
 
@@ -398,6 +442,83 @@ where
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<openraft::Snapshot<C>>, StorageError<C::NodeId>> {
-        todo!()
+        match &*self.inner.current_snapshot.read().await {
+            Some(snapshot) => {
+                let data = snapshot.data.clone();
+                Ok(Some(openraft::Snapshot {
+                    meta: snapshot.meta.clone(),
+                    snapshot: Box::new((self.snapshot_data_handle)(data)),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_state_machine_full {
+
+    use std::sync::Arc;
+
+    use openraft::RaftTypeConfig;
+    use openraft::StorageError;
+    use openraft::StoredMembership;
+    use redb::Database;
+
+    use crate::raft::statemachine::StateMachineArc;
+
+    use super::super::logstore::*;
+    use super::test_state_machine_snapshot::*;
+    use super::tests_raft_data::*;
+    use super::*;
+
+    // Alias is needed to have the good shaped signature.
+    // For the StoreBuilder trait implementation.
+    // Currying the MyAppData in :)
+    // Note we would like a bounding
+    // C: RaftTypeConfig , but that's not possible.
+    type Sma<C> = StateMachineArc<C, MyAppData>;
+    struct StoresBuilder;
+    impl openraft::testing::StoreBuilder<MyTypeConf, LogStore<MyTypeConf>, Sma<MyTypeConf>>
+        for StoresBuilder
+    {
+        #[doc = " Build a [`RaftLogStorage`] and [`RaftStateMachine`] implementation"]
+        async fn build(
+            &self,
+        ) -> Result<
+            ((), LogStore<MyTypeConf>, Sma<MyTypeConf>),
+            StorageError<<MyTypeConf as RaftTypeConfig>::NodeId>,
+        > {
+            // Build a logstore.
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let db = Database::create(file.path()).unwrap();
+            let ls = LogStore::<MyTypeConf>::new(Arc::new(db));
+
+            // Build a state machine.
+            // First build the Raft Data.
+            let d = RaftData::<MyTypeConf, MyAppData> {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                app_data: MyAppData { s: "Bla".into() },
+                apply_entry,
+            };
+
+            // Then build the new state machine:
+            let sm = StateMachine::new(d);
+            // Then the Arc, which is the one that implements the SM.
+            let asm = StateMachineArc {
+                inner: Arc::new(sm),
+                snapshot_data_handle,
+                snapshot_data_blank,
+                snapshot_data,
+            };
+
+            Ok(((), ls, asm))
+        }
+    }
+
+    #[test]
+    fn test_core() {
+        let _ = openraft::testing::Suite::test_all(StoresBuilder);
     }
 }
