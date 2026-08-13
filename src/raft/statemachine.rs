@@ -8,7 +8,12 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, storage::RaftStateMachine,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::RwLock,
+};
+use tonic_reflection::server::v1::ServerReflectionInfoStream;
 
 // Example there: https://github.com/databendlabs/openraft/blob/v0.9.21/examples/raft-kv-memstore/src/store/mod.rs#L79
 
@@ -111,7 +116,8 @@ mod tests_raft_data {
 }
 
 // A snapshot of the RaftData
-#[derive(Debug)]
+// Meant to fit in memory.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StoredSnapshot<C: RaftTypeConfig> {
     pub meta: openraft::SnapshotMeta<C::NodeId, C::Node>,
     /// The data of the state machine at the time of this snapshot.
@@ -125,7 +131,34 @@ pub struct StateMachine<C: RaftTypeConfig, AppData> {
     snapshot_idx: AtomicU64,
     // TODO: Persist this on disk, given
     // we choose to implement a Snapshot based state.
-    current_snapshot: RwLock<Option<StoredSnapshot<C>>>,
+    // The stored snapshot can be backed by persistent storage, like a file.
+    //current_snapshot: RwLock<Option<StoredSnapshot<C>>>,
+    current_snapshot: RwLock<Option<tokio::fs::File>>,
+}
+
+pub async fn stored_snapshot_file<C: RaftTypeConfig>(
+    snapshot: &StoredSnapshot<C>,
+) -> Result<File, StorageError<C::NodeId>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // TODO: Parametrise this file path.
+        .open("foo.txt")
+        .await
+        .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?;
+
+    file.write_all(
+        &serde_json::to_vec(&snapshot)
+            .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?,
+    )
+    .await
+    .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?;
+
+    file.sync_all()
+        .await
+        .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?;
+    Ok(file)
 }
 
 impl<C: RaftTypeConfig, AppData> StateMachine<C, AppData> {
@@ -141,8 +174,11 @@ impl<C: RaftTypeConfig, AppData> StateMachine<C, AppData> {
 pub struct StateMachineArc<C: RaftTypeConfig, AppData> {
     pub inner: Arc<StateMachine<C, AppData>>,
     // TODO: Change this so it can return an Result<..,  StorageError<C::NodeId>>
-    pub snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData,
+    // Vec<u8> is emited from the serialisation of the inner state machine.
+    pub snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData, // SnapshotData is an async IO handle.
+    // Used to receive a SnapshotData. Returns writeable async IO.
     pub snapshot_data_blank: fn() -> C::SnapshotData,
+    // Used to turn Snapshotdata handle back into bytes to install.
     pub snapshot_data: fn(C::SnapshotData) -> Vec<u8>,
 }
 
@@ -186,8 +222,12 @@ where
         // Lock the current snapshot before releasing the lock on the state machine, to avoid a race
         // condition on the written snapshot
         let mut current_snapshot = self.inner.current_snapshot.write().await;
-        // We have the raft data copy. Can drop the lock.
+        // We have the raft data copy. Can drop the lock on the state machine ASAP.
         drop(raft_data);
+
+        // Drop the File if it was there. This is to avoid opening the File
+        // on the same Path twice.
+        *current_snapshot = None;
 
         let snapshot_idx = self.inner.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = if let Some(last) = last_applied_log {
@@ -202,13 +242,14 @@ where
             snapshot_id,
         };
 
-        let snapshot = StoredSnapshot {
+        let snapshot = StoredSnapshot::<C> {
             meta: meta.clone(),
             data: app_data.clone(),
         };
 
-        // TODO: Persist this on disk.
-        *current_snapshot = Some(snapshot);
+        // Store the file
+        // Note that drops the old file too.
+        *current_snapshot = Some(stored_snapshot_file(&snapshot).await?);
 
         Ok(openraft::Snapshot {
             meta,
@@ -421,9 +462,9 @@ where
 
         // Update current snapshot.
         // TODO: Save that to disk.
-        *current_snapshot = Some(new_snapshot);
+        *current_snapshot = Some(stored_snapshot_file(&new_snapshot).await?);
 
-        todo!()
+        Ok(())
     }
 
     #[doc = " Get a readable handle to the current snapshot."]
@@ -442,11 +483,21 @@ where
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<openraft::Snapshot<C>>, StorageError<C::NodeId>> {
-        match &*self.inner.current_snapshot.read().await {
-            Some(snapshot) => {
-                let data = snapshot.data.clone();
+        match &mut *self.inner.current_snapshot.write().await {
+            Some(file) => {
+                // Get the bytes and deserialise into A StoredSnapshot
+                let mut buf = vec![];
+                file.read_to_end(&mut buf)
+                    .await
+                    .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+
+                let stored_snapshot: StoredSnapshot<C> = serde_json::from_slice(&buf)
+                    .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+
+                // The data persists in memory, so we can give a handle onto it
+                let data = stored_snapshot.data.clone();
                 Ok(Some(openraft::Snapshot {
-                    meta: snapshot.meta.clone(),
+                    meta: stored_snapshot.meta.clone(),
                     snapshot: Box::new((self.snapshot_data_handle)(data)),
                 }))
             }
