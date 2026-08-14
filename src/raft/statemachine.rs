@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use openraft::{
@@ -8,12 +11,13 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, storage::RaftStateMachine,
 };
 use serde::{Deserialize, Serialize};
+use serde_with::base64::Base64;
+use serde_with::serde_as;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     sync::RwLock,
 };
-use tonic_reflection::server::v1::ServerReflectionInfoStream;
 
 // Example there: https://github.com/databendlabs/openraft/blob/v0.9.21/examples/raft-kv-memstore/src/store/mod.rs#L79
 
@@ -117,10 +121,12 @@ mod tests_raft_data {
 
 // A snapshot of the RaftData
 // Meant to fit in memory.
+#[serde_as]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredSnapshot<C: RaftTypeConfig> {
     pub meta: openraft::SnapshotMeta<C::NodeId, C::Node>,
     /// The data of the state machine at the time of this snapshot.
+    #[serde_as(as = "Base64")]
     pub data: Vec<u8>,
 }
 
@@ -138,13 +144,18 @@ pub struct StateMachine<C: RaftTypeConfig, AppData> {
 
 pub async fn stored_snapshot_file<C: RaftTypeConfig>(
     snapshot: &StoredSnapshot<C>,
+    path: impl AsRef<std::path::Path>,
 ) -> Result<File, StorageError<C::NodeId>> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         // TODO: Parametrise this file path.
-        .open("foo.txt")
+        .open(path)
+        .await
+        .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?;
+    // Truncate. This is in case a previous file with the same name exists. Usually the case!
+    file.set_len(0)
         .await
         .map_err(|e| StorageIOError::write_snapshot(Some(snapshot.meta.signature()), &e))?;
 
@@ -173,6 +184,8 @@ impl<C: RaftTypeConfig, AppData> StateMachine<C, AppData> {
 
 pub struct StateMachineArc<C: RaftTypeConfig, AppData> {
     pub inner: Arc<StateMachine<C, AppData>>,
+    pub snapshot_path: PathBuf,
+
     // TODO: Change this so it can return an Result<..,  StorageError<C::NodeId>>
     // Vec<u8> is emited from the serialisation of the inner state machine.
     pub snapshot_data_handle: fn(Vec<u8>) -> C::SnapshotData, // SnapshotData is an async IO handle.
@@ -190,6 +203,7 @@ impl<C: RaftTypeConfig, AppData> Clone for StateMachineArc<C, AppData> {
             snapshot_data_handle: self.snapshot_data_handle,
             snapshot_data_blank: self.snapshot_data_blank,
             snapshot_data: self.snapshot_data,
+            snapshot_path: self.snapshot_path.clone(),
         }
     }
 }
@@ -249,7 +263,7 @@ where
 
         // Store the file
         // Note that drops the old file too.
-        *current_snapshot = Some(stored_snapshot_file(&snapshot).await?);
+        *current_snapshot = Some(stored_snapshot_file(&snapshot, &self.snapshot_path).await?);
 
         Ok(openraft::Snapshot {
             meta,
@@ -295,6 +309,7 @@ mod test_state_machine_snapshot {
 
         let mut asm = StateMachineArc {
             inner: Arc::new(sm),
+            snapshot_path: PathBuf::from("/tmp/foo.json"),
             snapshot_data_handle,
             snapshot_data_blank,
             snapshot_data,
@@ -462,7 +477,7 @@ where
 
         // Update current snapshot.
         // TODO: Save that to disk.
-        *current_snapshot = Some(stored_snapshot_file(&new_snapshot).await?);
+        *current_snapshot = Some(stored_snapshot_file(&new_snapshot, &self.snapshot_path).await?);
 
         Ok(())
     }
@@ -559,17 +574,18 @@ mod test_state_machine_full {
             // Then the Arc, which is the one that implements the SM.
             let asm = StateMachineArc {
                 inner: Arc::new(sm),
+                snapshot_path: PathBuf::from("/tmp/foo.json"),
                 snapshot_data_handle,
                 snapshot_data_blank,
                 snapshot_data,
             };
 
-            Ok(((), ls, asm))
+            Ok(((), ls.unwrap(), asm))
         }
     }
 
     #[test]
     fn test_core() {
-        let _ = openraft::testing::Suite::test_all(StoresBuilder);
+        assert_eq!(openraft::testing::Suite::test_all(StoresBuilder), Ok(()));
     }
 }

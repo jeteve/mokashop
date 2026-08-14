@@ -24,11 +24,19 @@ pub struct LogStore<C: RaftTypeConfig> {
 }
 
 impl<C: RaftTypeConfig> LogStore<C> {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self {
+    pub fn new(db: Arc<Database>) -> Result<Self, StorageError<C::NodeId>> {
+        // Make sure meta table and logs tables are there.
+        let write_tx = db.begin_write().map_err(to_storeerr::<C>)?;
+        {
+            let _ = write_tx.open_table(META_TABLE).map_err(to_storeerr::<C>)?;
+            let _ = write_tx.open_table(LOGS_TABLE).map_err(to_storeerr::<C>)?;
+        }
+        write_tx.commit().map_err(to_storeerr::<C>)?;
+
+        Ok(Self {
             db,
             _ctype: PhantomData::<C>,
-        }
+        })
     }
 }
 
@@ -117,7 +125,10 @@ impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C> {
         let last_entry = logs.last().map_err(to_storeerr::<C>)?;
 
         let last_log_id = last_entry
-            .map(|g| serde_json::from_slice::<LogId<C::NodeId>>(g.1.value()))
+            .map(|g| {
+                serde_json::from_slice::<C::Entry>(g.1.value())
+                    .map(|v: C::Entry| v.get_log_id().clone())
+            })
             .transpose()
             .map_err(to_storeerr::<C>)?;
 
@@ -264,8 +275,16 @@ mod tests {
     async fn test_my_storage() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = Database::create(file.path()).unwrap();
-        let mut store = LogStore::<ShardConfig>::new(Arc::new(db));
+        let store = LogStore::<ShardConfig>::new(Arc::new(db));
+
+        assert!(store.is_ok());
+
+        let mut store = store.unwrap();
+
         // See https://docs.rs/openraft/latest/src/openraft/testing/suite.rs.html
+
+        let rv_res = store.read_vote().await;
+        assert_eq!(rv_res, Ok(None));
 
         store.save_vote(&Vote::new(100, NODE_ID)).await.unwrap();
 
