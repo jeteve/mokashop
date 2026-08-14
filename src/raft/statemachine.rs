@@ -475,8 +475,7 @@ where
         let mut current_snapshot = self.inner.current_snapshot.write().await;
         drop(state_machine);
 
-        // Update current snapshot.
-        // TODO: Save that to disk.
+        // Update current snapshot to disk.
         *current_snapshot = Some(stored_snapshot_file(&new_snapshot, &self.snapshot_path).await?);
 
         Ok(())
