@@ -15,7 +15,7 @@ use serde_with::base64::Base64;
 use serde_with::serde_as;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::RwLock,
 };
 
@@ -502,6 +502,9 @@ where
             Some(file) => {
                 // Get the bytes and deserialise into A StoredSnapshot
                 let mut buf = vec![];
+                file.seek(std::io::SeekFrom::Start(0))
+                    .await
+                    .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
                 file.read_to_end(&mut buf)
                     .await
                     .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
